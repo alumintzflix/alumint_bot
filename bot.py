@@ -14,7 +14,7 @@ dp = Dispatcher(bot)
 logging.basicConfig(level=logging.INFO)
 
 # In-memory database (for demo)
-admin_id = 123456789  # <-- এখানে আপনার Telegram ID বসান
+admin_id = 1784602112  # <-- এখানে আপনার Telegram ID বসান
 employees = set()
 tasks = {}
 click_logs = {}
