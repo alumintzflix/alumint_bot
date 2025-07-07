@@ -6,21 +6,28 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.markdown import hbold
+from aiogram.client.default import DefaultBotProperties # এই লাইনটি নতুন!
 from dotenv import load_dotenv
 from aiohttp import web
 
+# Load .env variables (for local development)
 load_dotenv()
 
+# --- Configuration from Environment Variables ---
 API_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
-bot = Bot(token=API_TOKEN, parse_mode=ParseMode.HTML)
+# --- Bot Initialization ---
+# DefaultBotProperties ব্যবহার করে parse_mode সেট করা হয়েছে (aiogram 3.7.0+ এর জন্য)
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)) # এখানে পরিবর্তন করা হয়েছে!
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
+# --- SQLite Database Setup ---
 conn = sqlite3.connect("bot.db")
 cur = conn.cursor()
 
+# Create tables if they don't exist
 cur.execute("""
 CREATE TABLE IF NOT EXISTS employees (
     username TEXT PRIMARY KEY,
@@ -42,6 +49,8 @@ CREATE TABLE IF NOT EXISTS clicks (
 """)
 conn.commit()
 
+# --- Telegram Bot Command Handlers ---
+
 @dp.message(Command("add_employee"))
 async def add_employee(message: types.Message):
     if str(message.from_user.id) != ADMIN_CHAT_ID:
@@ -50,7 +59,7 @@ async def add_employee(message: types.Message):
         parts = message.text.split()
         if len(parts) < 2:
             return await message.reply("⚠️ সঠিকভাবে লিখুন: /add_employee @username <Telegram_ID>")
-
+        
         username = parts[1].replace('@', '')
         telegram_id = int(parts[2]) if len(parts) > 2 else None
 
@@ -74,12 +83,12 @@ async def get_task(message: types.Message):
     cur.execute("SELECT username FROM employees WHERE username = ?", (username,))
     if not cur.fetchone():
         return await message.reply("❌ আপনি এমপ্লয়ি তালিকায় নেই!")
-
+    
     movie_site_base_url = "https://yourmoviesite.com/movie/"
     task_identifier = "some_movie_id_or_slug"
-
+    
     link = f"{movie_site_base_url}{task_identifier}?ref={username}" 
-
+    
     cur.execute("INSERT OR REPLACE INTO tasks (username, task_link) VALUES (?, ?)", (username, link))
     conn.commit()
     await message.reply(f"🎯 আজকের টাস্ক লিংক:\n{link}")
@@ -88,7 +97,7 @@ async def get_task(message: types.Message):
 async def get_report(message: types.Message):
     if str(message.from_user.id) != ADMIN_CHAT_ID:
         return await message.reply("❌ আপনি অ্যাডমিন নন!")
-
+    
     report = "📋 Task Report:\n\n"
     cur.execute("SELECT username, task_link FROM tasks")
     tasks = cur.fetchall()
@@ -100,19 +109,21 @@ async def get_report(message: types.Message):
             cur.execute("SELECT viewer_info FROM clicks WHERE ref = ?", (emp_username,))
             viewers = [row[0] for row in cur.fetchall()]
             report += f"👨‍💼 @{emp_username}\n🔗 Link: {link}\n👁️ Views: {len(viewers)}\n👤 Users: {', '.join(viewers) if viewers else 'None'}\n\n"
-
+    
     await message.reply(report)
 
 @dp.message(CommandStart())
 async def send_welcome(message: types.Message):
     await message.reply(f"👋 স্বাগতম, {hbold(message.from_user.full_name)}! আপনি যদি এমপ্লয়ি হন, /get_task লিখুন।")
 
+# --- Web Server for handling external HTTP requests (from footer.php) ---
+
 async def track_click_handler(request):
     try:
         data = await request.json()
         ref = data.get('ref')
         viewer_info = data.get('user_agent', 'Unknown User')
-
+        
         if ref:
             cur.execute("INSERT INTO clicks (ref, viewer_info) VALUES (?, ?)", (ref, viewer_info))
             conn.commit()
@@ -127,7 +138,7 @@ async def track_click_handler(request):
                     )
                 except Exception as e:
                     logging.error(f"Failed to send admin notification: {e}")
-
+            
             return web.json_response({"status": "success", "message": "Click tracked successfully"})
         else:
             return web.json_response({"status": "error", "message": "Missing 'ref' parameter"}, status=400)
@@ -135,6 +146,7 @@ async def track_click_handler(request):
         logging.error(f"Error in track_click_handler: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
+# --- Main function to run both polling and web server ---
 async def main() -> None:
     polling_task = asyncio.create_task(dp.start_polling(bot))
 
