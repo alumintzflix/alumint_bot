@@ -1,12 +1,12 @@
 services:
   - type: web
-    name: alumint-task-bot # এই নামটি তোমার Render সার্ভিসের নামের সাথে মিলতে হবে
+    name: alumint-task-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9 # runtime.txt এও 3.11.9 আছে, তাই এটি সামঞ্জস্যপূর্ণ
+        value: 3.11.9 # runtime.txt এর সাথে সামঞ্জস্যপূর্ণ
       - key: BOT_TOKEN
         sync: false # এই ভ্যালু Render ড্যাশবোর্ডে সেট করবে
       - key: ADMIN_CHAT_ID
