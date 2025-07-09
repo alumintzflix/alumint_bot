@@ -12,7 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.utils.markdown import hbold, hcode
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
-from aiohttp import web # <--- এই লাইনটি যোগ করুন
+from aiohttp import web
 
 # Load .env variables
 load_dotenv()
@@ -533,6 +533,7 @@ async def employee_command_list(message: types.Message):
         "/my_profile - আপনার প্রোফাইল তথ্য দেখুন\n"
         "/set_profile (বা /change_profile) - আপনার প্রোফাইল সেট/পরিবর্তন করুন\n"
         "/my_balance - আপনার USDT ব্যালেন্স দেখুন\n"
+        "/claim_usdt - ভিজিট থেকে USDT তে রূপান্তর করুন (নতুন কমান্ড)\n" # <-- নতুন কমান্ড যোগ করা হয়েছে
         "/withdraw_usdt - ব্যালেন্স উত্তোলন করুন\n"
     )
     await message.reply(commands_text, parse_mode=ParseMode.HTML)
@@ -573,6 +574,7 @@ async def admin_command_list(message: types.Message):
         "/set_usdt <amount> - প্রতি 1000 ভিজিট এর জন্য USDT রেট সেট করুন (যেমন: /set_usdt 1.00)\n"
         "/em_visit_add @username <visits> - কর্মচারীর ভিজিট যোগ করুন (যেমন: /em_visit_add @user 115)\n"
         "/em_visit_minus @username <visits> - কর্মচারীর ভিজিট কাটুন (যেমন: /em_visit_minus @user 115)\n"
+        "/convert_visits_to_usdt @username - ভিজিট থেকে USDT তে রূপান্তর করুন (এই কমান্ড অ্যাডমিনদের জন্য থাকবে)\n"
     )
     await message.reply(commands_text, parse_mode=ParseMode.HTML)
 
@@ -599,7 +601,7 @@ async def admin_add_employee_handler(message: types.Message):
                 conn.commit()
                 await message.reply(f"✅ @{username} (ID: {telegram_id if telegram_id else 'N/A'}) কে সফলভাবে আনব্যান করা হলো এবং এমপ্লয়ি হিসেবে পুনঃযুক্ত করা হলো!")
             else:
-                await message.reply(f"ℹ️ @{username} ইতিমধ্যেই একজন এমপ্লয়ি হিসেবে নিবন্ধিত আছেন।")
+                await message.reply(f"ℹ️ @{username} ইতিমধ্যেই একজন এমপ্লয়ি হিসেবে নিবন্ধিত আছেন।")
         else:
             cur.execute("INSERT INTO employees (username, telegram_id, banned) VALUES (?, ?, ?)", (username, telegram_id, 0))
             conn.commit()
@@ -838,6 +840,86 @@ async def employee_visit_minus_handler(message: types.Message):
     except Exception as e:
         await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
 
+# --- ADMIN COMMAND: Convert total_visits to usdt_balance (still admin only for specific employee conversion) ---
+@dp.message(Command("convert_visits_to_usdt"))
+async def convert_visits_to_usdt_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            return await message.reply("⚠️ সঠিকভাবে লিখুন: /convert_visits_to_usdt @username")
+        
+        target_username = parts[1].replace('@', '')
+
+        cur.execute("SELECT total_visits, usdt_balance FROM employees WHERE username = ?", (target_username,))
+        employee_data = cur.fetchone()
+
+        if not employee_data:
+            return await message.reply(f"ℹ️ @{target_username} নামে কোনো কর্মচারী পাওয়া যায়নি।")
+        
+        total_visits = employee_data[0]
+        current_usdt_balance = employee_data[1]
+
+        if total_visits == 0:
+            return await message.reply(f"ℹ️ @{target_username} এর কোনো নতুন ভিজিট নেই যা USDT তে কনভার্ট করা যাবে।")
+
+        cur.execute("SELECT value FROM global_settings WHERE key = 'usdt_rate_per_1000_visits'")
+        usdt_rate_str = cur.fetchone()
+        usdt_rate = float(usdt_rate_str[0]) if usdt_rate_str else 0.0
+
+        if usdt_rate == 0.0:
+            return await message.reply("❌ USDT রেট সেট করা নেই। দয়া করে অ্যাডমিন `/set_usdt` কমান্ড ব্যবহার করে সেট করুন।")
+
+        usdt_to_add = (total_visits / 1000) * usdt_rate
+
+        # Update usdt_balance and reset total_visits
+        cur.execute("UPDATE employees SET usdt_balance = ?, total_visits = 0 WHERE username = ?",
+                    (current_usdt_balance + usdt_to_add, target_username))
+        conn.commit()
+
+        await message.reply(f"✅ @{target_username} এর {total_visits} ভিজিট সফলভাবে {usdt_to_add:.2f} USDT তে কনভার্ট করা হয়েছে। বর্তমান উত্তোলনযোগ্য ব্যালেন্স: {current_usdt_balance + usdt_to_add:.2f} USDT। ভিজিট সংখ্যা ০ তে রিসেট করা হলো।")
+
+    except ValueError:
+        await message.reply("❌ অবৈধ ইনপুট।")
+    except Exception as e:
+        await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
+
+# --- EMPLOYEE COMMAND: Convert own total_visits to usdt_balance ---
+@dp.message(Command("claim_usdt"))
+async def claim_usdt_handler(message: types.Message):
+    username = message.from_user.username
+    if not username:
+        return await message.reply("❌ আপনার টেলিগ্রাম ইউজারনেম সেট করা নেই।")
+
+    cur.execute("SELECT total_visits, usdt_balance FROM employees WHERE username = ?", (username,))
+    employee_data = cur.fetchone()
+
+    if not employee_data:
+        return await message.reply("❌ আপনি একজন নিবন্ধিত কর্মচারী নন। `/join_employee` কমান্ড ব্যবহার করে যুক্ত হন।")
+    
+    total_visits = employee_data[0]
+    current_usdt_balance = employee_data[1]
+
+    if total_visits == 0:
+        return await message.reply("ℹ️ আপনার কোনো নতুন ভিজিট নেই যা USDT তে কনভার্ট করা যাবে।")
+
+    cur.execute("SELECT value FROM global_settings WHERE key = 'usdt_rate_per_1000_visits'")
+    usdt_rate_str = cur.fetchone()
+    usdt_rate = float(usdt_rate_str[0]) if usdt_rate_str else 0.0
+
+    if usdt_rate == 0.0:
+        return await message.reply("❌ USDT রেট সেট করা নেই। দয়া করে অ্যাডমিনকে `/set_usdt` কমান্ড ব্যবহার করে সেট করতে বলুন।")
+
+    usdt_to_add = (total_visits / 1000) * usdt_rate
+
+    # Update usdt_balance and reset total_visits
+    cur.execute("UPDATE employees SET usdt_balance = ?, total_visits = 0 WHERE username = ?",
+                (current_usdt_balance + usdt_to_add, username))
+    conn.commit()
+
+    await message.reply(f"✅ আপনার {total_visits} ভিজিট সফলভাবে {usdt_to_add:.2f} USDT তে কনভার্ট করা হয়েছে। আপনার বর্তমান উত্তোলনযোগ্য ব্যালেন্স: {current_usdt_balance + usdt_to_add:.2f} USDT। ভিজিট সংখ্যা ০ তে রিসেট করা হলো।")
+
 
 @dp.message(Command("my_balance"))
 async def my_balance_handler(message: types.Message):
@@ -870,6 +952,7 @@ async def my_balance_handler(message: types.Message):
         f"💵 আনুমানিক USDT ব্যালেন্স: {calculated_usdt:.2f} USDT\n"
         f"আপনার বর্তমান উত্তোলনযোগ্য ব্যালেন্স: {current_usdt_balance:.2f} USDT\n"
         f"পেন্ডিং উত্তোলন: {pending_withdrawals}টি\n\n"
+        f"ভিজিট থেকে USDT তে রূপান্তর করতে: `/claim_usdt`\n" # <--- এই লাইনটি যোগ করা হয়েছে
         f"উত্তোলন করতে: `/withdraw_usdt`"
     , parse_mode=ParseMode.HTML)
 
@@ -984,7 +1067,7 @@ async def process_withdraw_comment(message: types.Message, state: FSMContext):
     amount = data['usdt_amount']
     payment_method = data['payment_method']
     
-    cur.execute("SELECT bkash_number, binance_id FROM employees WHERE username = ?", (username,))
+    cur.execute("SELECT bkash_number, binance_id FROM employees WHERE username = ?, (username,))
     profile_data = cur.fetchone()
     payment_detail = profile_data[0] if payment_method == "Bkash" else profile_data[1]
 
@@ -993,6 +1076,10 @@ async def process_withdraw_comment(message: types.Message, state: FSMContext):
         INSERT INTO withdraw_requests (employee_username, usdt_amount, payment_method, payment_detail, comment)
         VALUES (?, ?, ?, ?, ?)
     """, (username, amount, payment_method, payment_detail, comment))
+    conn.commit()
+
+    # Deduct amount from user's usdt_balance
+    cur.execute("UPDATE employees SET usdt_balance = usdt_balance - ? WHERE username = ?", (amount, username))
     conn.commit()
 
     await message.reply(
@@ -1020,76 +1107,99 @@ async def track_click_handler(request):
         is_telegram_browser = data.get('is_telegram_browser', False)
 
         today_date = datetime.date.today().isoformat()
-        # More generalized unique daily key for 20 visits per day limit (username + date + ref_by_employee + page_url)
-        unique_daily_key_base = f"{viewer_telegram_id or viewer_username}_{today_date}"
+        # More generalized unique daily key for 20 visits per day for the same viewer on the same page
+        # The key should combine viewer, date, and page_url (not ref_by_employee for uniqueness across multiple referrals to the same page)
+        unique_daily_key_for_viewer_page = f"{viewer_telegram_id or viewer_username}_{today_date}_{page_url}"
 
-        # Check daily visit limit (max 20 per day per user/device for a specific employee)
-        cur.execute("""
-            SELECT COUNT(*) FROM clicks 
-            WHERE ref_by_employee = ? 
-            AND (viewer_telegram_id = ? OR viewer_username = ?) 
-            AND STRFTIME('%Y-%m-%d', timestamp) = ?
-        """, (ref_by_employee, viewer_telegram_id, viewer_username, today_date))
-        
-        visits_today = cur.fetchone()[0]
-
-        if visits_today >= 20:
-            logging.info(f"Daily visit limit reached for {viewer_username} for employee {ref_by_employee}.")
-            return web.json_response({"status": "limit_reached", "message": "Daily visit limit reached for this user."})
-
-
-        # Check if this specific page+employee has been visited by this user today (to avoid double counting same page visit for the same day)
-        # This is more precise unique_daily_key for the DB row.
-        unique_entry_key = f"{viewer_telegram_id or viewer_username}_{today_date}_{ref_by_employee}_{page_url}"
-        cur.execute("SELECT id FROM clicks WHERE unique_daily_key = ?", (unique_entry_key,))
+        # Check if this specific page has been visited by this viewer today (to avoid double counting same page visit for the same day)
+        cur.execute("SELECT id FROM clicks WHERE unique_daily_key = ? AND is_visit = 1", (unique_daily_key_for_viewer_page,))
         if cur.fetchone():
-            logging.info(f"Duplicate click for {unique_entry_key}. Skipping.")
-            return web.json_response({"status": "duplicate", "message": "Duplicate click for this specific page/user today."})
+            logging.info(f"Duplicate visit for {unique_daily_key_for_viewer_page}. Skipping visit count.")
+            # Still track the click if it's new, but don't increment visit count again
+            # We will still log the click, but only increment total_visits once per page per day per viewer
+            # However, the user also needs to prevent general 20 clicks per day.
+            # So, we first check the 20 clicks limit, then the unique visit.
 
+            # We need to refine the unique_daily_key to prevent more than 20 TOTAL clicks by the same viewer_telegram_id/viewer_username PER DAY, regardless of referrer or page.
+            # The existing unique_daily_key is tied to ref_by_employee and page_url, which is too specific for the 20-visit limit.
+            # Let's adjust the 20 visit limit check.
 
-        # Insert into clicks table
-        cur.execute("""
-            INSERT INTO clicks (ref_by_employee, viewer_telegram_id, viewer_username, viewer_full_name,
-                                user_agent, page_url, is_visit, is_click, is_telegram_browser, unique_daily_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            ref_by_employee, viewer_telegram_id, viewer_username, viewer_full_name,
-            user_agent, page_url, is_visit_flag, True, is_telegram_browser, unique_entry_key
-        ))
-        conn.commit()
+            # Check daily TOTAL click limit for this viewer (max 20 per day per viewer)
+            cur.execute("""
+                SELECT COUNT(*) FROM clicks 
+                WHERE (viewer_telegram_id = ? OR viewer_username = ?) 
+                AND STRFTIME('%Y-%m-%d', timestamp) = ?
+            """, (viewer_telegram_id, viewer_username, today_date))
+            
+            total_clicks_today_for_viewer = cur.fetchone()[0]
 
-        # Update employee's total_visits/total_clicks
-        if is_visit_flag:
-            cur.execute("UPDATE employees SET total_visits = total_visits + 1 WHERE username = ?", (ref_by_employee,))
-        cur.execute("UPDATE employees SET total_clicks = total_clicks + 1 WHERE username = ?", (ref_by_employee,))
-        conn.commit()
-        
-        logging.info(f"Tracked click for ref: {ref_by_employee}, viewer: {viewer_username}, URL: {page_url}, Visit: {is_visit_flag}")
+            if total_clicks_today_for_viewer >= 20:
+                logging.info(f"Daily total click limit reached for {viewer_username}.")
+                return web.json_response({"status": "limit_reached", "message": "Daily total click limit reached for this user."})
+            
+            # If it's a duplicate visit for the same page/viewer, we will still record the click, but not increment employee's total_visits
+            # The employee's total_visits is only for UNIQUE visits (12+ seconds) based on page_url per viewer per day.
+            # If is_visit_flag is True, and it's a duplicate for unique_daily_key_for_viewer_page, we don't increment total_visits for employee.
+            # But we still record this click in 'clicks' table as is_click = True.
 
-        if ADMIN_CHAT_ID:
-            try:
-                domain_name = urlparse(page_url).netloc
-                status_emoji = "✅ ভিজিট" if is_visit_flag else "🔗 ক্লিক"
-                await bot.send_message(
-                    chat_id=int(ADMIN_CHAT_ID),
-                    text=(f"<b>{status_emoji} রেকর্ড করা হয়েছে!</b>\n"
-                          f"<b>রেফারেল:</b> <code>{ref_by_employee}</code>\n"
-                          f"<b>ডোমেইন:</b> {domain_name}\n"
-                          f"<b>পেজ URL:</b> {hcode(page_url)}\n"
-                          f"<b>ভিউয়ার:</b> {hbold(viewer_full_name)} (@{viewer_username})\n"
-                          f"<b>ব্রাউজার:</b> {'Telegram' if is_telegram_browser else 'External'}\n"
-                          f"<b>ইউজার এজেন্ট:</b> <code>{user_agent}</code>"),
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception as e:
-                logging.error(f"Failed to send admin notification: {e}")
-        
-        return web.json_response({"status": "success", "message": "Click tracked successfully"})
+            # Check if this specific page+employee has already been counted as a visit by this user today
+            # This is for the employee's total_visits
+            unique_employee_page_visit_key = f"{ref_by_employee}_{viewer_telegram_id or viewer_username}_{today_date}_{page_url}"
+            cur.execute("SELECT id FROM clicks WHERE unique_daily_key = ? AND is_visit = 1", (unique_employee_page_visit_key,))
+            is_duplicate_employee_page_visit = cur.fetchone() is not None
+
+            # Insert into clicks table
+            cur.execute("""
+                INSERT INTO clicks (ref_by_employee, viewer_telegram_id, viewer_username, viewer_full_name,
+                                    user_agent, page_url, is_visit, is_click, is_telegram_browser, unique_daily_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                ref_by_employee, viewer_telegram_id, viewer_username, viewer_full_name,
+                user_agent, page_url, is_visit_flag, True, is_telegram_browser, unique_employee_page_visit_key
+            ))
+            conn.commit()
+
+            # Update employee's total_visits only if it's a new unique visit for them
+            if is_visit_flag and not is_duplicate_employee_page_visit:
+                cur.execute("UPDATE employees SET total_visits = total_visits + 1 WHERE username = ?", (ref_by_employee,))
+                conn.commit()
+            
+            # Always update total_clicks for the employee for any new click (even if it's a duplicate visit or not a visit)
+            cur.execute("UPDATE employees SET total_clicks = total_clicks + 1 WHERE username = ?", (ref_by_employee,))
+            conn.commit()
+            
+            logging.info(f"Tracked click for ref: {ref_by_employee}, viewer: {viewer_username}, URL: {page_url}, Visit: {is_visit_flag}, Duplicate Visit: {is_duplicate_employee_page_visit}")
+
+            if ADMIN_CHAT_ID:
+                try:
+                    domain_name = urlparse(page_url).netloc
+                    status_emoji = "✅ ভিজিট" if is_visit_flag else "🔗 ক্লিক"
+                    notification_message = (f"<b>{status_emoji} রেকর্ড করা হয়েছে!</b>\n"
+                                          f"<b>রেফারেল:</b> <code>{ref_by_employee}</code>\n"
+                                          f"<b>ডোমেইন:</b> {domain_name}\n"
+                                          f"<b>পেজ URL:</b> {hcode(page_url)}\n"
+                                          f"<b>ভিউয়ার:</b> {hbold(viewer_full_name)} (@{viewer_username})\n"
+                                          f"<b>ব্রাউজার:</b> {'Telegram' if is_telegram_browser else 'External'}\n"
+                                          f"<b>ইউজার এজেন্ট:</b> <code>{user_agent}</code>")
+                    if is_visit_flag and is_duplicate_employee_page_visit:
+                        notification_message += "\n\n(ℹ️ এই ভিজিটটি আজ এই পেজের জন্য ইতিমধ্যে গণনা করা হয়েছে, তাই এমপ্লয়ির ভিজিট সংখ্যা বাড়ানো হয়নি।)"
+
+                    await bot.send_message(
+                        chat_id=int(ADMIN_CHAT_ID),
+                        text=notification_message,
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to send admin notification: {e}")
+            
+            return web.json_response({"status": "success", "message": "Click tracked successfully"})
+
     except Exception as e:
         logging.error(f"Error in track_click_handler: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 # --- Main function to run both polling and web server ---
+
 async def main() -> None:
     polling_task = asyncio.create_task(dp.start_polling(bot))
 
