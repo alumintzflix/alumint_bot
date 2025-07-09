@@ -12,6 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.utils.markdown import hbold, hcode
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
+from aiohttp import web # <--- এই লাইনটি যোগ করুন
 
 # Load .env variables
 load_dotenv()
