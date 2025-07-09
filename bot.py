@@ -12,7 +12,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.utils.markdown import hbold, hcode
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
-from aiohttp import web
 
 # Load .env variables
 load_dotenv()
@@ -184,6 +183,26 @@ def is_editor(user_id):
     result = cur.fetchone()
     return result and result[0] == 1
 
+# Define commands that editors can also use (subset of admin commands)
+# These are commands where editor access is granted via the `has_editor_permission` function
+EDITOR_ALLOWED_ADMIN_COMMANDS = [
+    "list_employees", # Already handled by is_admin or is_editor check directly in handler
+    "click_user_list",
+    "report", # Adding report for editors
+    "list_domains", # Adding list_domains for editors
+    "channel_list", # Editors can see public lists
+    "earning_bot_list", # Editors can see public lists
+    "site_list" # Editors can see public lists
+]
+
+def has_editor_permission(user_id, command_name):
+    if not is_editor(user_id):
+        return False
+    # Check if the command (without '/') is in the allowed list
+    # The command_name from message.text will be like "click_user_list"
+    return command_name in EDITOR_ALLOWED_ADMIN_COMMANDS
+
+
 # --- Telegram Bot Command Handlers ---
 
 # START Command - Improved Welcome Message & Public Commands
@@ -239,7 +258,7 @@ async def send_welcome(message: types.Message, state: FSMContext):
     await message.reply(welcome_message, parse_mode=ParseMode.HTML)
 
 
-# --- Public Commands ---
+# --- Public Commands (already has is_editor_permission for list, channel_list, earning_bot_list, site_list) ---
 @dp.message(Command("bot_info"))
 async def bot_info_handler(message: types.Message):
     info_text = (
@@ -261,6 +280,7 @@ async def contact_handler(message: types.Message):
 
 @dp.message(Command("channel_list"))
 async def channel_list_handler(message: types.Message):
+    # Publicly accessible, but also included in editor permission list for clarity in has_editor_permission
     cur.execute("SELECT name, description, link FROM channels")
     channels = cur.fetchall()
     if not channels:
@@ -273,6 +293,7 @@ async def channel_list_handler(message: types.Message):
 
 @dp.message(Command("earning_bot_list"))
 async def earning_bot_list_handler(message: types.Message):
+    # Publicly accessible, but also included in editor permission list for clarity in has_editor_permission
     cur.execute("SELECT name, description, link FROM earning_bots")
     bots = cur.fetchall()
     if not bots:
@@ -285,6 +306,7 @@ async def earning_bot_list_handler(message: types.Message):
 
 @dp.message(Command("site_list"))
 async def site_list_handler(message: types.Message):
+    # Publicly accessible, but also included in editor permission list for clarity in has_editor_permission
     cur.execute("SELECT name, base_url FROM domains")
     domains = cur.fetchall()
     if not domains:
@@ -517,7 +539,7 @@ async def employee_command_list(message: types.Message):
 
 # --- Existing Commands (modified) ---
 
-# Admin Commands List (from previous, now with new commands)
+# Admin Commands List (from previous, now with new commands and editor access notes)
 @dp.message(Command("ad_cmd"))
 async def admin_command_list(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -529,24 +551,27 @@ async def admin_command_list(message: types.Message):
         "/em_cmd - এমপ্লয়ি কমান্ড তালিকা দেখুন\n"
         "/add_employee @username <Telegram_ID> - নতুন কর্মচারী যুক্ত করুন (অ্যাডমিন অনুমোদিত)\n"
         "/delete_employee @username - কর্মচারী মুছে ফেলুন\n"
-        "/list_employees - সকল কর্মচারীর তালিকা দেখুন\n"
-        "/click_user_list - রেফারেল লিংক ক্লিক করা ব্যবহারকারীদের তালিকা দেখুন\n" # NEW
-        "/band_employee @username - কর্মচারীকে নিষিদ্ধ করুন\n" # NEW
+        "/list_employees - সকল কর্মচারীর তালিকা দেখুন (এডিটরদেরও অনুমতি আছে)\n"
+        "/click_user_list - রেফারেল লিংক ক্লিক করা ব্যবহারকারীদের তালিকা দেখুন (এডিটরদেরও অনুমতি আছে)\n"
+        "/band_employee @username - কর্মচারীকে নিষিদ্ধ করুন\n"
+        "/add_editor @username - কর্মচারীকে এডিটর হিসেবে যুক্ত করুন\n"
+        "/remove_editor @username - কর্মচারীকে এডিটর থেকে অপসারণ করুন\n"
+        "/report - টাস্ক এবং ভিউ রিপোর্ট দেখুন (এডিটরদেরও অনুমতি আছে)\n"
+        "/list_domains - সকল ডোমেইন তালিকা দেখুন (এডিটরদেরও অনুমতি আছে)\n"
+        "/channel_list - আমাদের চ্যানেলগুলো দেখুন (এডিটরদেরও অনুমতি আছে)\n"
+        "/earning_bot_list - আয়ের অন্যান্য বট দেখুন (এডিটরদেরও অনুমতি আছে)\n"
+        "/site_list - আমাদের ওয়েবসাইটগুলো দেখুন (এডিটরদেরও অনুমতি আছে)\n"
         "/add_domain <name> <base_url> - নতুন ডোমেইন যোগ করুন\n"
         "/delete_domain <name> - ডোমেইন মুছে ফেলুন\n"
-        "/list_domains - সকল ডোমেইন তালিকা দেখুন\n"
         "/add_channel Channel Name: <name> Channel Description: <desc> Channel Link: <link> - নতুন চ্যানেল যোগ করুন\n"
         "/add_bot Bot Name: <name> Bot Description: <desc> Bot Link: <link> - নতুন আর্নিং বট যোগ করুন\n"
         "/set_global_task <domain_name> <task_identifier> - সকল কর্মচারীর জন্য গ্লোবাল টাস্ক সেট করুন\n"
         "/assign_task @username <domain_name> <task_identifier> - নির্দিষ্ট কর্মচারীকে টাস্ক দিন\n"
-        "/report - টাস্ক এবং ভিউ রিপোর্ট দেখুন\n"
         "/post_all <আপনার_মেসেজ> - সকল কর্মচারীকে মেসেজ পাঠান\n"
         "/post_to_employee @username <আপনার_মেসেজ> - নির্দিষ্ট কর্মচারীকে মেসেজ পাঠান\n"
         "/set_usdt <amount> - প্রতি 1000 ভিজিট এর জন্য USDT রেট সেট করুন (যেমন: /set_usdt 1.00)\n"
         "/em_visit_add @username <visits> - কর্মচারীর ভিজিট যোগ করুন (যেমন: /em_visit_add @user 115)\n"
         "/em_visit_minus @username <visits> - কর্মচারীর ভিজিট কাটুন (যেমন: /em_visit_minus @user 115)\n"
-        # /clear_data commands will be added later due to complexity
-        # /add_editor, /track_editors will be added later
     )
     await message.reply(commands_text, parse_mode=ParseMode.HTML)
 
@@ -616,29 +641,70 @@ async def band_employee_handler(message: types.Message):
     except Exception as e:
         await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
 
+@dp.message(Command("add_editor")) # NEW
+async def add_editor_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    try:
+        username = message.text.split()[1].replace('@', '')
+        cur.execute("UPDATE employees SET is_editor = 1 WHERE username = ?", (username,))
+        conn.commit()
+        if cur.rowcount > 0:
+            await message.reply(f"✅ @{username} কে সফলভাবে এডিটর হিসেবে যুক্ত করা হলো।")
+        else:
+            await message.reply(f"ℹ️ @{username} নামে কোনো কর্মচারী পাওয়া যায়নি।")
+    except IndexError:
+        await message.reply("⚠️ সঠিকভাবে লিখুন: /add_editor @username")
+    except Exception as e:
+        await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
+
+@dp.message(Command("remove_editor")) # NEW
+async def remove_editor_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    try:
+        username = message.text.split()[1].replace('@', '')
+        cur.execute("UPDATE employees SET is_editor = 0 WHERE username = ?", (username,))
+        conn.commit()
+        if cur.rowcount > 0:
+            await message.reply(f"✅ @{username} কে সফলভাবে এডিটর থেকে অপসারণ করা হলো।")
+        else:
+            await message.reply(f"ℹ️ @{username} নামে কোনো কর্মচারী পাওয়া যায়নি।")
+    except IndexError:
+        await message.reply("⚠️ সঠিকভাবে লিখুন: /remove_editor @username")
+    except Exception as e:
+        await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
+
 @dp.message(Command("list_employees"))
 async def list_employees(message: types.Message):
-    if not (is_admin(message.from_user.id) or is_editor(message.from_user.id)): # Admins and Editors can see
+    # Editors (via has_editor_permission) and Admins can use this
+    if not (is_admin(message.from_user.id) or has_editor_permission(message.from_user.id, "list_employees")):
         return await message.reply("❌ আপনার এই কমান্ড ব্যবহারের অনুমতি নেই!")
     
-    cur.execute("SELECT username, full_name, total_visits, usdt_balance, banned FROM employees")
+    cur.execute("SELECT username, full_name, total_visits, usdt_balance, banned, is_editor FROM employees")
     employees = cur.fetchall()
     if not employees:
         return await message.reply("ℹ️ কোনো এমপ্লয়ি পাওয়া যায়নি।")
     
     employee_list_text = "👥 <b>এমপ্লয়িদের তালিকা:</b>\n\n"
-    for emp_username, emp_full_name, total_visits, usdt_balance, banned_status in employees:
-        status_text = "🚫 Banned" if banned_status else ""
+    for emp_username, emp_full_name, total_visits, usdt_balance, banned_status, is_editor_status in employees:
+        status_text = ""
+        if banned_status:
+            status_text += "🚫 Banned"
+        if is_editor_status:
+            status_text += " ✨ Editor"
+        
         employee_list_text += (
-            f"<b>@{emp_username}</b> ({emp_full_name or 'N/A'}) {status_text}\n"
+            f"<b>@{emp_username}</b> ({emp_full_name or 'N/A'}) {status_text.strip()}\n"
             f"  👁️ ভিজিট: {total_visits}, 💰 ব্যালেন্স: {usdt_balance:.2f} USDT\n"
         )
     await message.reply(employee_list_text, parse_mode=ParseMode.HTML)
 
-@dp.message(Command("click_user_list")) # NEW
+@dp.message(Command("click_user_list")) # NEW - now also for editors
 async def click_user_list_handler(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    # Editors (via has_editor_permission) and Admins can use this
+    if not (is_admin(message.from_user.id) or has_editor_permission(message.from_user.id, "click_user_list")):
+        return await message.reply("❌ আপনি অ্যাডমিন নন বা এই কমান্ড ব্যবহারের অনুমতি নেই!")
     
     # Select distinct viewer_username and viewer_full_name from clicks
     # Exclude those who are also employees
@@ -657,6 +723,44 @@ async def click_user_list_handler(message: types.Message):
     for username, full_name, telegram_id in clicked_users:
         user_list_text += f"• <b>{full_name or 'N/A'}</b> (@{username or 'N/A'}) [ID: {telegram_id or 'N/A'}]\n"
     await message.reply(user_list_text, parse_mode=ParseMode.HTML)
+
+@dp.message(Command("report")) # Now also for editors
+async def get_report(message: types.Message):
+    if not (is_admin(message.from_user.id) or has_editor_permission(message.from_user.id, "report")):
+        return await message.reply("❌ আপনার এই কমান্ড ব্যবহারের অনুমতি নেই!")
+    
+    report_text = "📋 <b>রিপোর্ট:</b>\n\n"
+    
+    # Total Clicks and Visits
+    cur.execute("SELECT COUNT(*), SUM(CASE WHEN is_visit = 1 THEN 1 ELSE 0 END) FROM clicks")
+    total_clicks, total_visits = cur.fetchone()
+    report_text += f"🔗 মোট ক্লিক: {total_clicks or 0}\n"
+    report_text += f"👁️ মোট ভিজিট (১২+ সেকেন্ড): {total_visits or 0}\n\n"
+
+    # Top Employees by Visits
+    cur.execute("SELECT username, total_visits FROM employees ORDER BY total_visits DESC LIMIT 5")
+    top_employees = cur.fetchall()
+    if top_employees:
+        report_text += "📈 <b>শীর্ষ ৫ এমপ্লয়ি (ভিজিট অনুযায়ী):</b>\n"
+        for i, (username, visits) in enumerate(top_employees):
+            report_text += f"{i+1}. @{username}: {visits} ভিজিট\n"
+        report_text += "\n"
+
+    # Recent Withdraw Requests (Pending)
+    cur.execute("""
+        SELECT employee_username, usdt_amount, payment_method, payment_detail, request_date
+        FROM withdraw_requests WHERE status = 'pending' ORDER BY request_date DESC LIMIT 5
+    """)
+    pending_withdraws = cur.fetchall()
+    if pending_withdraws:
+        report_text += "⏳ <b>সাম্প্রতিক পেন্ডিং উত্তোলন অনুরোধ:</b>\n"
+        for username, amount, method, detail, date in pending_withdraws:
+            report_text += f"• @{username}: {amount:.2f} USDT ({method}, {detail}) - {date}\n"
+        report_text += "\n"
+    else:
+        report_text += "ℹ️ কোনো পেন্ডিং উত্তোলন অনুরোধ নেই।\n\n"
+
+    await message.reply(report_text, parse_mode=ParseMode.HTML)
 
 
 # --- Balance and Visit Adjustment ---
@@ -915,7 +1019,7 @@ async def track_click_handler(request):
         is_telegram_browser = data.get('is_telegram_browser', False)
 
         today_date = datetime.date.today().isoformat()
-        # More generalized unique daily key for 20 visits per user/device
+        # More generalized unique daily key for 20 visits per day limit (username + date + ref_by_employee + page_url)
         unique_daily_key_base = f"{viewer_telegram_id or viewer_username}_{today_date}"
 
         # Check daily visit limit (max 20 per day per user/device for a specific employee)
