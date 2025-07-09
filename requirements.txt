@@ -1,5 +1,5 @@
-# requirements.txt
-aiogram==3.10.0 # aiogram এর একটি স্থিতিশীল সংস্করণ
-aiohttp==3.9.5 # Python 3.11 এর সাথে সামঞ্জস্যপূর্ণ
-asyncio # যদি explicitly দরকার হয়
-python-dotenv # যদি .env ফাইল ব্যবহার করো
+aiogram==3.4.1
+pymongo[srv]==4.6.1
+python-dotenv==1.0.1
+aiohttp==3.9.5
+
