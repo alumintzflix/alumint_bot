@@ -1061,7 +1061,7 @@ async def process_withdraw_comment(message: types.Message, state: FSMContext):
     amount = data['usdt_amount']
     payment_method = data['payment_method']
     
-    # CORRECTED LINE 1070:
+    # CORRECTED LINE:
     cur.execute("SELECT bkash_number, binance_id FROM employees WHERE username = ?", (username,))
     profile_data = cur.fetchone()
     payment_detail = profile_data[0] if payment_method == "Bkash" else profile_data[1]
