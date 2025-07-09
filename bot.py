@@ -2,146 +2,984 @@ import logging
 import os
 import sqlite3
 import asyncio
-from aiogram import Bot, Dispatcher, types
+import datetime
+from urllib.parse import urlparse
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
-from aiogram.utils.markdown import hbold
-from aiogram.client.default import DefaultBotProperties # এই লাইনটি নতুন!
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.utils.markdown import hbold, hcode
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 from aiohttp import web
 
-# Load .env variables (for local development)
+# Load .env variables
 load_dotenv()
 
 # --- Configuration from Environment Variables ---
 API_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+WEB_SERVER_URL = os.getenv("WEB_SERVER_URL") # Example: https://your-render-app.onrender.com
 
 # --- Bot Initialization ---
-# DefaultBotProperties ব্যবহার করে parse_mode সেট করা হয়েছে (aiogram 3.7.0+ এর জন্য)
-bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)) # এখানে পরিবর্তন করা হয়েছে!
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
+
+# --- FSM States for Profile Setup ---
+class ProfileSetup(StatesGroup):
+    name = State()
+    phone = State()
+    email = State()
+    bkash = State()
+    binance_id = State()
+    youtube = State()
+    facebook = State()
+    tiktok = State()
+    website = State()
+    about_yourself = State()
+
+# --- FSM States for Withdrawal ---
+class Withdrawal(StatesGroup):
+    amount = State()
+    payment_method = State()
+    comment = State()
 
 # --- SQLite Database Setup ---
 conn = sqlite3.connect("bot.db")
 cur = conn.cursor()
 
-# Create tables if they don't exist
+# Create/Update tables
+# employees table: user details and profile info, now with banned and is_editor flags
 cur.execute("""
 CREATE TABLE IF NOT EXISTS employees (
     username TEXT PRIMARY KEY,
-    telegram_id INTEGER UNIQUE
+    telegram_id INTEGER UNIQUE,
+    is_admin BOOLEAN DEFAULT 0,
+    is_editor BOOLEAN DEFAULT 0,
+    profile_set BOOLEAN DEFAULT 0,
+    banned BOOLEAN DEFAULT 0,
+    full_name TEXT,
+    phone_number TEXT,
+    email TEXT,
+    bkash_number TEXT,
+    binance_id TEXT,
+    youtube_link TEXT,
+    facebook_link TEXT,
+    tiktok_link TEXT,
+    website_link TEXT,
+    about_yourself TEXT,
+    total_visits INTEGER DEFAULT 0,
+    total_clicks INTEGER DEFAULT 0,
+    usdt_balance REAL DEFAULT 0.0
 )
 """)
+
+# domains table: to store allowed movie site domains (from previous)
 cur.execute("""
-CREATE TABLE IF NOT EXISTS tasks (
-    username TEXT PRIMARY KEY,
-    task_link TEXT
+CREATE TABLE IF NOT EXISTS domains (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,
+    base_url TEXT
 )
 """)
+
+# global_tasks table: for a single task assigned to all employees (from previous)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS global_tasks (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    task_identifier TEXT,
+    domain_id INTEGER,
+    last_set_date TEXT,
+    FOREIGN KEY (domain_id) REFERENCES domains(id)
+)
+""")
+
+# individual_tasks table: for tasks assigned to specific employees (from previous)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS individual_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_username TEXT,
+    task_identifier TEXT,
+    domain_id INTEGER,
+    assigned_by TEXT,
+    assigned_date TEXT DEFAULT CURRENT_TIMESTAMP,
+    status TEXT DEFAULT 'pending',
+    FOREIGN KEY (employee_username) REFERENCES employees(username),
+    FOREIGN KEY (domain_id) REFERENCES domains(id)
+)
+""")
+
+# clicks table: to track user clicks and duration, now with more details
 cur.execute("""
 CREATE TABLE IF NOT EXISTS clicks (
-    ref TEXT,
-    viewer_info TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref_by_employee TEXT, -- The employee's username
+    viewer_telegram_id INTEGER, -- The Telegram ID of the user who clicked
+    viewer_username TEXT, -- The Telegram username of the user who clicked
+    viewer_full_name TEXT, -- The Telegram full name of the user who clicked
+    user_agent TEXT, -- Browser user agent
+    page_url TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    is_visit BOOLEAN DEFAULT 0, -- True if stayed >= 12 seconds
+    is_click BOOLEAN DEFAULT 0, -- True if detected, regardless of duration
+    is_telegram_browser BOOLEAN DEFAULT 0, -- True if opened in Telegram's internal browser
+    unique_daily_key TEXT UNIQUE -- For 20 visits per day limit (username + date + ref_by_employee + page_url)
 )
 """)
+
+# New tables for public lists
+cur.execute("""
+CREATE TABLE IF NOT EXISTS channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,
+    description TEXT,
+    link TEXT UNIQUE
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS earning_bots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,
+    description TEXT,
+    link TEXT UNIQUE
+)
+""")
+
+# Global settings for visit to USDT rate
+cur.execute("""
+CREATE TABLE IF NOT EXISTS global_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+# Initialize default USDT rate if not exists
+cur.execute("INSERT OR IGNORE INTO global_settings (key, value) VALUES (?, ?)", ('usdt_rate_per_1000_visits', '1.00'))
+
+# New table for withdrawal requests
+cur.execute("""
+CREATE TABLE IF NOT EXISTS withdraw_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_username TEXT,
+    usdt_amount REAL,
+    payment_method TEXT, -- 'Bkash' or 'Binance'
+    payment_detail TEXT, -- The Bkash number or Binance ID from profile
+    comment TEXT, -- User's 60 char comment
+    request_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+    status TEXT DEFAULT 'pending', -- 'pending', 'approved', 'rejected'
+    FOREIGN KEY (employee_username) REFERENCES employees(username)
+)
+""")
+
 conn.commit()
+
+# --- Helper functions ---
+def is_admin(user_id):
+    return str(user_id) == ADMIN_CHAT_ID
+
+def is_editor(user_id):
+    cur.execute("SELECT is_editor FROM employees WHERE telegram_id = ?", (user_id,))
+    result = cur.fetchone()
+    return result and result[0] == 1
 
 # --- Telegram Bot Command Handlers ---
 
-@dp.message(Command("add_employee"))
-async def add_employee(message: types.Message):
-    if str(message.from_user.id) != ADMIN_CHAT_ID:
+# START Command - Improved Welcome Message & Public Commands
+@dp.message(CommandStart())
+async def send_welcome(message: types.Message, state: FSMContext):
+    user_username = message.from_user.username
+    user_id = message.from_user.id
+
+    welcome_message = (
+        "👋 <b>স্বাগতম!</b> এই বট আপনাকে অনলাইনে আয় করার চমৎকার সুযোগ করে দেবে। সহজ টাস্ক সম্পূর্ণ করে আপনি সহজেই USDT উপার্জন করতে পারবেন!\n\n"
+        "Hello! This bot offers you an excellent opportunity to earn online. Complete simple tasks and easily earn USDT!\n\n"
+    )
+    
+    # Check if user is an employee
+    cur.execute("SELECT profile_set, banned FROM employees WHERE username = ? OR telegram_id = ?", (user_username, user_id))
+    employee_status = cur.fetchone()
+
+    is_already_employee = False
+    profile_is_set = False
+    is_banned = False
+
+    if employee_status:
+        is_already_employee = True
+        profile_is_set = employee_status[0]
+        is_banned = employee_status[1]
+
+    if is_banned:
+        welcome_message += "🚫 দুঃখিত, আপনি এই বট থেকে নিষিদ্ধ (banned) হয়েছেন। আপনি কোনো কার্যক্রম করতে পারবেন না।"
+        await message.reply(welcome_message, parse_mode=ParseMode.HTML)
+        return
+
+    if is_already_employee:
+        welcome_message += "আপনার বর্তমান স্ট্যাটাস: <b>এমপ্লয়ি</b>\n\n"
+        if not profile_is_set:
+            welcome_message += "⚠️ আপনার প্রোফাইল সেট করা নেই। দয়া করে `/set_profile` কমান্ড ব্যবহার করে আপনার প্রোফাইল সেট করুন।"
+            # Start profile setup FSM if not set
+            await state.set_state(ProfileSetup.name)
+            await message.answer("আপনার <b>পুরো নাম</b> লিখুন:") # Initial prompt for profile setup
+            return # Exit early to proceed with FSM
+    else:
+        welcome_message += "আপনি কি আমাদের সাথে কাজ করে আয় করতে চান? `/join_employee` কমান্ড ব্যবহার করে একজন এমপ্লয়ি হিসেবে যুক্ত হন!\n\n"
+        
+    welcome_message += (
+        "🌐 <b>সাধারণ কমান্ডসমূহ:</b>\n"
+        "/bot_info - এই বট সম্পর্কে জানুন\n"
+        "/help_group - সাহায্য পেতে গ্রুপে যোগ দিন\n"
+        "/contact - আমাদের সাথে যোগাযোগ করুন\n"
+        "/channel_list - আমাদের চ্যানেলগুলো দেখুন\n"
+        "/earning_bot_list - আয়ের অন্যান্য বট দেখুন\n"
+        "/site_list - আমাদের ওয়েবসাইটগুলো দেখুন\n"
+        "/em_cmd - এমপ্লয়ি কমান্ড তালিকা (যদি আপনি এমপ্লয়ি হন)\n"
+    )
+    await message.reply(welcome_message, parse_mode=ParseMode.HTML)
+
+
+# --- Public Commands ---
+@dp.message(Command("bot_info"))
+async def bot_info_handler(message: types.Message):
+    info_text = (
+        "🤖 <b>আলুমিন্ট টাস্ক বট - আপনার আয়ের সঙ্গী!</b>\n\n"
+        "এই বটটি আপনাকে বিভিন্ন অনলাইন টাস্ক (যেমন ওয়েবসাইট ভিজিট, ভিডিও দেখা) সম্পন্ন করার মাধ্যমে সহজ উপায়ে USDT উপার্জন করার সুযোগ দেয়। আমাদের এমপ্লয়ি হিসেবে যোগ দিয়ে আপনি আপনার রেফারেল লিংকের মাধ্যমে ভিজিটর এনে আয় করতে পারবেন। এখানে আপনি আপনার কাজের অগ্রগতি, আয় এবং পেমেন্টের তথ্য ট্র্যাক করতে পারবেন।\n\n"
+        "<b>English:</b>\n"
+        "🤖 <b>Alumint Task Bot - Your Earning Companion!</b>\n\n"
+        "This bot provides you with an easy way to earn USDT by completing various online tasks (like website visits, watching videos). By joining as our employee, you can earn by bringing visitors through your referral links. Here, you can track your work progress, earnings, and payment information."
+    )
+    await message.reply(info_text, parse_mode=ParseMode.HTML)
+
+@dp.message(Command("help_group"))
+async def help_group_handler(message: types.Message):
+    await message.reply("Need help? Join our support group here: [ZflixCO Group](https://t.me/zflixcogroup)", parse_mode=ParseMode.HTML)
+
+@dp.message(Command("contact"))
+async def contact_handler(message: types.Message):
+    await message.reply("For business inquiries or direct support, contact us: @zflix_contract", parse_mode=ParseMode.HTML)
+
+@dp.message(Command("channel_list"))
+async def channel_list_handler(message: types.Message):
+    cur.execute("SELECT name, description, link FROM channels")
+    channels = cur.fetchall()
+    if not channels:
+        return await message.reply("ℹ️ কোনো চ্যানেল যুক্ত করা হয়নি।")
+    
+    channel_text = "📢 <b>আমাদের চ্যানেলসমূহ:</b>\n\n"
+    for name, desc, link in channels:
+        channel_text += f"<b>{name}</b>\n{desc}\n[Join Channel]({link})\n\n"
+    await message.reply(channel_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+@dp.message(Command("earning_bot_list"))
+async def earning_bot_list_handler(message: types.Message):
+    cur.execute("SELECT name, description, link FROM earning_bots")
+    bots = cur.fetchall()
+    if not bots:
+        return await message.reply("ℹ️ কোনো আয়ের বট যুক্ত করা হয়নি।")
+    
+    bot_text = "💰 <b>আয়ের অন্যান্য বট:</b>\n\n"
+    for name, desc, link in bots:
+        bot_text += f"<b>{name}</b>\n{desc}\n[Start Bot]({link})\n\n"
+    await message.reply(bot_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+@dp.message(Command("site_list"))
+async def site_list_handler(message: types.Message):
+    cur.execute("SELECT name, base_url FROM domains")
+    domains = cur.fetchall()
+    if not domains:
+        return await message.reply("ℹ️ কোনো ওয়েবসাইট যুক্ত করা হয়নি।")
+    
+    site_text = "🌐 <b>আমাদের ওয়েবসাইটসমূহ:</b>\n\n"
+    for name, url in domains:
+        site_text += f"<b>{name}</b>\n[ভিজিট করুন]({url})\n\n"
+    await message.reply(site_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+# --- Admin Commands for Public Lists ---
+@dp.message(Command("add_channel"))
+async def add_channel_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
         return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    try:
+        parts = message.text.split(" ", 3) # /add_channel Name: Desc: Link:
+        if len(parts) < 4 or not all(p.endswith(":") for p in parts[1:3]):
+            return await message.reply("⚠️ সঠিকভাবে লিখুন: /add_channel Channel Name: <name> Channel Description: <desc> Channel Link: <link>")
+        
+        # Simple parsing for now, could be more robust
+        channel_name = parts[1].replace("Name:", "").strip()
+        channel_desc = parts[2].replace("Description:", "").strip()
+        channel_link = parts[3].replace("Link:", "").strip()
+
+        cur.execute("INSERT INTO channels (name, description, link) VALUES (?, ?, ?)", (channel_name, channel_desc, channel_link))
+        conn.commit()
+        await message.reply(f"✅ চ্যানেল '{channel_name}' সফলভাবে যুক্ত করা হলো।")
+    except sqlite3.IntegrityError:
+        await message.reply(f"⚠️ এই চ্যানেলটি ইতিমধ্যেই বিদ্যমান।")
+    except Exception as e:
+        await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
+
+@dp.message(Command("add_bot"))
+async def add_earning_bot_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    try:
+        parts = message.text.split(" ", 3) # /add_bot Name: Desc: Link:
+        if len(parts) < 4 or not all(p.endswith(":") for p in parts[1:3]):
+            return await message.reply("⚠️ সঠিকভাবে লিখুন: /add_bot Bot Name: <name> Bot Description: <desc> Bot Link: <link>")
+        
+        bot_name = parts[1].replace("Name:", "").strip()
+        bot_desc = parts[2].replace("Description:", "").strip()
+        bot_link = parts[3].replace("Link:", "").strip()
+
+        cur.execute("INSERT INTO earning_bots (name, description, link) VALUES (?, ?, ?)", (bot_name, bot_desc, bot_link))
+        conn.commit()
+        await message.reply(f"✅ বট '{bot_name}' সফলভাবে যুক্ত করা হলো।")
+    except sqlite3.IntegrityError:
+        await message.reply(f"⚠️ এই বটটি ইতিমধ্যেই বিদ্যমান।")
+    except Exception as e:
+        await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
+
+
+# --- Employee Self-Registration: New command `join_employee` ---
+@dp.message(Command("join_employee"))
+async def self_join_employee_handler(message: types.Message, state: FSMContext):
+    username = message.from_user.username
+    telegram_id = message.from_user.id
+    if not username:
+        return await message.reply("❌ আপনার টেলিগ্রাম ইউজারনেম সেট করা নেই। দয়া করে সেটিংস থেকে সেট করুন।")
+    
+    cur.execute("SELECT username, banned FROM employees WHERE username = ? OR telegram_id = ?", (username, telegram_id))
+    employee_data = cur.fetchone()
+
+    if employee_data:
+        if employee_data[1]: # Check if banned
+            return await message.reply("🚫 দুঃখিত, আপনি এই বট থেকে নিষিদ্ধ (banned) হয়েছেন। আপনি যুক্ত হতে পারবেন না।")
+        else:
+            return await message.reply("ℹ️ আপনি ইতিমধ্যেই একজন এমপ্লয়ি হিসেবে নিবন্ধিত আছেন।")
+    
+    # Add to employees table with profile_set = 0 and banned = 0
+    cur.execute("INSERT INTO employees (username, telegram_id, profile_set, banned) VALUES (?, ?, ?, ?)", (username, telegram_id, 0, 0))
+    conn.commit()
+    await message.reply(f"✅ @{username} আপনাকে এমপ্লয়ি হিসেবে যুক্ত করা হলো! এখন আপনার প্রোফাইল সেট করার পালা।")
+    
+    # Start profile setup FSM
+    await state.set_state(ProfileSetup.name)
+    await message.answer("আপনার <b>পুরো নাম</b> লিখুন:")
+
+
+# --- Profile Management (FSM) ---
+
+@dp.message(Command("set_profile", "change_profile"))
+async def start_profile_setup(message: types.Message, state: FSMContext):
+    username = message.from_user.username
+    cur.execute("SELECT username FROM employees WHERE username = ?", (username,))
+    if not cur.fetchone():
+        return await message.reply("❌ আপনি এমপ্লয়ি নন।`/join_employee` কমান্ড ব্যবহার করে যুক্ত হন।")
+    
+    await state.set_state(ProfileSetup.name)
+    await message.answer("আপনার <b>পুরো নাম</b> লিখুন:")
+
+@dp.message(ProfileSetup.name)
+async def process_name(message: types.Message, state: FSMContext):
+    await state.update_data(full_name=message.text)
+    await message.answer("আপনার <b>ফোন নম্বর</b> লিখুন:")
+    await state.set_state(ProfileSetup.phone)
+
+@dp.message(ProfileSetup.phone)
+async def process_phone(message: types.Message, state: FSMContext):
+    await state.update_data(phone_number=message.text)
+    await message.answer("আপনার <b>ইমেইল</b> লিখুন:")
+    await state.set_state(ProfileSetup.email)
+
+@dp.message(ProfileSetup.email)
+async def process_email(message: types.Message, state: FSMContext):
+    await state.update_data(email=message.text)
+    await message.answer("আপনার <b>বিকাশ নম্বর</b> লিখুন:")
+    await state.set_state(ProfileSetup.bkash)
+
+@dp.message(ProfileSetup.bkash)
+async def process_bkash(message: types.Message, state: FSMContext):
+    await state.update_data(bkash_number=message.text)
+    await message.answer("আপনার <b>Binance ID</b> লিখুন:")
+    await state.set_state(ProfileSetup.binance_id)
+
+@dp.message(ProfileSetup.binance_id)
+async def process_binance(message: types.Message, state: FSMContext):
+    await state.update_data(binance_id=message.text)
+    await message.answer("আপনার <b>Youtube Link</b> (যদি থাকে) লিখুন:")
+    await state.set_state(ProfileSetup.youtube)
+
+@dp.message(ProfileSetup.youtube)
+async def process_youtube(message: types.Message, state: FSMContext):
+    await state.update_data(youtube_link=message.text)
+    await message.answer("আপনার <b>Facebook Link</b> (যদি থাকে) লিখুন:")
+    await state.set_state(ProfileSetup.facebook)
+
+@dp.message(ProfileSetup.facebook)
+async def process_facebook(message: types.Message, state: FSMContext):
+    await state.update_data(facebook_link=message.text)
+    await message.answer("আপনার <b>TikTok Link</b> (যদি থাকে) লিখুন:")
+    await state.set_state(ProfileSetup.tiktok)
+
+@dp.message(ProfileSetup.tiktok)
+async def process_tiktok(message: types.Message, state: FSMContext):
+    await state.update_data(tiktok_link=message.text)
+    await message.answer("আপনার <b>Website Link</b> (যদি থাকে) লিখুন:")
+    await state.set_state(ProfileSetup.website)
+
+@dp.message(ProfileSetup.website)
+async def process_website(message: types.Message, state: FSMContext):
+    await state.update_data(website_link=message.text)
+    await message.answer("আপনার সম্পর্কে <b>কিছু কথা</b> লিখুন:")
+    await state.set_state(ProfileSetup.about_yourself)
+
+@dp.message(ProfileSetup.about_yourself)
+async def process_about_yourself(message: types.Message, state: FSMContext):
+    await state.update_data(about_yourself=message.text)
+    
+    user_data = await state.get_data()
+    username = message.from_user.username
+
+    cur.execute("""
+        UPDATE employees SET
+        profile_set = ?, full_name = ?, phone_number = ?, email = ?,
+        bkash_number = ?, binance_id = ?, youtube_link = ?,
+        facebook_link = ?, tiktok_link = ?, website_link = ?,
+        about_yourself = ?
+        WHERE username = ?
+    """, (
+        1, user_data['full_name'], user_data['phone_number'], user_data['email'],
+        user_data['bkash_number'], user_data['binance_id'], user_data['youtube_link'],
+        user_data['facebook_link'], user_data['tiktok_link'], user_data['website_link'],
+        user_data['about_yourself'], username
+    ))
+    conn.commit()
+    
+    await message.reply("✅ আপনার প্রোফাইল সফলভাবে সেট/আপডেট করা হয়েছে!")
+    await state.clear()
+
+@dp.message(Command("my_profile"))
+async def my_profile_handler(message: types.Message):
+    username = message.from_user.username
+    if not username:
+        return await message.reply("❌ আপনার টেলিগ্রাম ইউজারনেম সেট করা নেই।")
+    
+    cur.execute("""
+        SELECT full_name, phone_number, email, bkash_number, binance_id,
+               youtube_link, facebook_link, tiktok_link, website_link, about_yourself,
+               profile_set
+        FROM employees WHERE username = ?
+    """, (username,))
+    profile_data = cur.fetchone()
+
+    if not profile_data:
+        return await message.reply("❌ আপনি একজন নিবন্ধিত কর্মচারী নন। `/join_employee` কমান্ড ব্যবহার করে যুক্ত হন।")
+    
+    (full_name, phone, email, bkash, binance, youtube, facebook, tiktok, website, about, profile_set) = profile_data
+
+    if not profile_set:
+        return await message.reply("⚠️ আপনার প্রোফাইল সেট করা নেই। `/set_profile` কমান্ড ব্যবহার করে আপনার প্রোফাইল সেট করুন।")
+
+    profile_text = (
+        f"👤 <b>আপনার প্রোফাইল:</b>\n\n"
+        f"<b>নাম:</b> {full_name or 'N/A'}\n"
+        f"<b>ফোন:</b> {phone or 'N/A'}\n"
+        f"<b>ইমেইল:</b> {email or 'N/A'}\n"
+        f"<b>বিকাশ নম্বর:</b> {bkash or 'N/A'}\n"
+        f"<b>Binance ID:</b> {binance or 'N/A'}\n"
+        f"<b>Youtube:</b> {youtube or 'N/A'}\n"
+        f"<b>Facebook:</b> {facebook or 'N/A'}\n"
+        f"<b>TikTok:</b> {tiktok or 'N/A'}\n"
+        f"<b>Website:</b> {website or 'N/A'}\n"
+        f"<b>About:</b> {about or 'N/A'}\n\n"
+        "প্রোফাইল পরিবর্তন করতে: `/change_profile`"
+    )
+    await message.reply(profile_text, parse_mode=ParseMode.HTML)
+
+
+# --- Employee Commands List (updated) ---
+@dp.message(Command("em_cmd", "my_cmd")) # Added my_cmd as an alias
+async def employee_command_list(message: types.Message):
+    commands_text = (
+        "📋 <b>এমপ্লয়ি কমান্ডসমূহ:</b>\n\n"
+        "/start - বটের সাথে কথা বলা শুরু করুন\n"
+        "/em_cmd (বা /my_cmd) - এই কমান্ড তালিকা দেখুন\n"
+        "/get_task - আপনার টাস্ক লিংক পান\n"
+        "/my_views - আপনার রেফারেল ভিউ সংখ্যা দেখুন\n"
+        "/my_profile - আপনার প্রোফাইল তথ্য দেখুন\n"
+        "/set_profile (বা /change_profile) - আপনার প্রোফাইল সেট/পরিবর্তন করুন\n"
+        "/my_balance - আপনার USDT ব্যালেন্স দেখুন\n"
+        "/withdraw_usdt - ব্যালেন্স উত্তোলন করুন\n"
+    )
+    await message.reply(commands_text, parse_mode=ParseMode.HTML)
+
+
+# --- Existing Commands (modified) ---
+
+# Admin Commands List (from previous, now with new commands)
+@dp.message(Command("ad_cmd"))
+async def admin_command_list(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    
+    commands_text = (
+        "📋 <b>অ্যাডমিন কমান্ডসমূহ:</b>\n\n"
+        "/ad_cmd - এই কমান্ড তালিকা দেখুন\n"
+        "/em_cmd - এমপ্লয়ি কমান্ড তালিকা দেখুন\n"
+        "/add_employee @username <Telegram_ID> - নতুন কর্মচারী যুক্ত করুন (অ্যাডমিন অনুমোদিত)\n"
+        "/delete_employee @username - কর্মচারী মুছে ফেলুন\n"
+        "/list_employees - সকল কর্মচারীর তালিকা দেখুন\n"
+        "/click_user_list - রেফারেল লিংক ক্লিক করা ব্যবহারকারীদের তালিকা দেখুন\n" # NEW
+        "/band_employee @username - কর্মচারীকে নিষিদ্ধ করুন\n" # NEW
+        "/add_domain <name> <base_url> - নতুন ডোমেইন যোগ করুন\n"
+        "/delete_domain <name> - ডোমেইন মুছে ফেলুন\n"
+        "/list_domains - সকল ডোমেইন তালিকা দেখুন\n"
+        "/add_channel Channel Name: <name> Channel Description: <desc> Channel Link: <link> - নতুন চ্যানেল যোগ করুন\n"
+        "/add_bot Bot Name: <name> Bot Description: <desc> Bot Link: <link> - নতুন আর্নিং বট যোগ করুন\n"
+        "/set_global_task <domain_name> <task_identifier> - সকল কর্মচারীর জন্য গ্লোবাল টাস্ক সেট করুন\n"
+        "/assign_task @username <domain_name> <task_identifier> - নির্দিষ্ট কর্মচারীকে টাস্ক দিন\n"
+        "/report - টাস্ক এবং ভিউ রিপোর্ট দেখুন\n"
+        "/post_all <আপনার_মেসেজ> - সকল কর্মচারীকে মেসেজ পাঠান\n"
+        "/post_to_employee @username <আপনার_মেসেজ> - নির্দিষ্ট কর্মচারীকে মেসেজ পাঠান\n"
+        "/set_usdt <amount> - প্রতি 1000 ভিজিট এর জন্য USDT রেট সেট করুন (যেমন: /set_usdt 1.00)\n"
+        "/em_visit_add @username <visits> - কর্মচারীর ভিজিট যোগ করুন (যেমন: /em_visit_add @user 115)\n"
+        "/em_visit_minus @username <visits> - কর্মচারীর ভিজিট কাটুন (যেমন: /em_visit_minus @user 115)\n"
+        # /clear_data commands will be added later due to complexity
+        # /add_editor, /track_editors will be added later
+    )
+    await message.reply(commands_text, parse_mode=ParseMode.HTML)
+
+
+# Admin Employee Management (already exists, but updated for 'banned' status)
+@dp.message(Command("add_employee"))
+async def admin_add_employee_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!") # Only admin can use this form of add_employee
     try:
         parts = message.text.split()
         if len(parts) < 2:
-            return await message.reply("⚠️ সঠিকভাবে লিখুন: /add_employee @username <Telegram_ID>")
+            return await message.reply("⚠️ সঠিকভাবে লিখুন: /add_employee @username <Telegram_ID (ঐচ্ছিক)>")
         
         username = parts[1].replace('@', '')
-        telegram_id = int(parts[2]) if len(parts) > 2 else None
+        telegram_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
 
-        if telegram_id:
-            cur.execute("INSERT OR IGNORE INTO employees (username, telegram_id) VALUES (?, ?)", (username, telegram_id))
+        cur.execute("SELECT banned FROM employees WHERE username = ?", (username,))
+        existing_employee = cur.fetchone()
+
+        if existing_employee:
+            if existing_employee[0]: # If banned, unban them
+                cur.execute("UPDATE employees SET banned = 0, telegram_id = ? WHERE username = ?", (telegram_id, username))
+                conn.commit()
+                await message.reply(f"✅ @{username} (ID: {telegram_id if telegram_id else 'N/A'}) কে সফলভাবে আনব্যান করা হলো এবং এমপ্লয়ি হিসেবে পুনঃযুক্ত করা হলো!")
+            else:
+                await message.reply(f"ℹ️ @{username} ইতিমধ্যেই একজন এমপ্লয়ি হিসেবে নিবন্ধিত আছেন।")
         else:
-            cur.execute("INSERT OR IGNORE INTO employees (username) VALUES (?)", (username,))
-        conn.commit()
-        await message.reply(f"✅ @{username} (ID: {telegram_id if telegram_id else 'N/A'}) কে এমপ্লয়ি হিসেবে যুক্ত করা হলো!")
+            cur.execute("INSERT INTO employees (username, telegram_id, banned) VALUES (?, ?, ?)", (username, telegram_id, 0))
+            conn.commit()
+            await message.reply(f"✅ @{username} (ID: {telegram_id if telegram_id else 'N/A'}) কে এমপ্লয়ি হিসেবে যুক্ত করা হলো!")
     except (IndexError, ValueError):
         await message.reply("⚠️ সঠিকভাবে লিখুন: /add_employee @username <Telegram_ID (ঐচ্ছিক)>")
     except Exception as e:
         await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
 
-@dp.message(Command("get_task"))
-async def get_task(message: types.Message):
-    username = message.from_user.username
-    if not username:
-        return await message.reply("❌ আপনার টেলিগ্রাম ইউজারনেম সেট করা নেই। দয়া করে সেটিংস থেকে সেট করুন।")
+@dp.message(Command("delete_employee"))
+async def delete_employee(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    try:
+        username = message.text.split()[1].replace('@', '')
+        cur.execute("DELETE FROM employees WHERE username = ?", (username,))
+        cur.execute("DELETE FROM individual_tasks WHERE employee_username = ?", (username,)) # Delete associated tasks
+        conn.commit()
+        if cur.rowcount > 0:
+            await message.reply(f"✅ @{username} কে এমপ্লয়ি তালিকা থেকে মুছে ফেলা হলো এবং তার টাস্কগুলোও ডিলিট করা হলো।")
+        else:
+            await message.reply(f"ℹ️ @{username} নামে কোনো এমপ্লয়ি পাওয়া যায়নি।")
+    except IndexError:
+        await message.reply("⚠️ সঠিকভাবে লিখুন: /delete_employee @username")
 
-    cur.execute("SELECT username FROM employees WHERE username = ?", (username,))
-    if not cur.fetchone():
-        return await message.reply("❌ আপনি এমপ্লয়ি তালিকায় নেই!")
-    
-    movie_site_base_url = "https://yourmoviesite.com/movie/"
-    task_identifier = "some_movie_id_or_slug"
-    
-    link = f"{movie_site_base_url}{task_identifier}?ref={username}" 
-    
-    cur.execute("INSERT OR REPLACE INTO tasks (username, task_link) VALUES (?, ?)", (username, link))
-    conn.commit()
-    await message.reply(f"🎯 আজকের টাস্ক লিংক:\n{link}")
+@dp.message(Command("band_employee")) # NEW
+async def band_employee_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    try:
+        username = message.text.split()[1].replace('@', '')
+        cur.execute("UPDATE employees SET banned = 1 WHERE username = ?", (username,))
+        conn.commit()
+        if cur.rowcount > 0:
+            await message.reply(f"✅ @{username} কে সফলভাবে নিষিদ্ধ (banned) করা হলো। সে আর নিজে থেকে জয়েন করতে পারবে না।")
+        else:
+            await message.reply(f"ℹ️ @{username} নামে কোনো এমপ্লয়ি পাওয়া যায়নি।")
+    except IndexError:
+        await message.reply("⚠️ সঠিকভাবে লিখুন: /band_employee @username")
+    except Exception as e:
+        await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
 
-@dp.message(Command("report"))
-async def get_report(message: types.Message):
-    if str(message.from_user.id) != ADMIN_CHAT_ID:
+@dp.message(Command("list_employees"))
+async def list_employees(message: types.Message):
+    if not (is_admin(message.from_user.id) or is_editor(message.from_user.id)): # Admins and Editors can see
+        return await message.reply("❌ আপনার এই কমান্ড ব্যবহারের অনুমতি নেই!")
+    
+    cur.execute("SELECT username, full_name, total_visits, usdt_balance, banned FROM employees")
+    employees = cur.fetchall()
+    if not employees:
+        return await message.reply("ℹ️ কোনো এমপ্লয়ি পাওয়া যায়নি।")
+    
+    employee_list_text = "👥 <b>এমপ্লয়িদের তালিকা:</b>\n\n"
+    for emp_username, emp_full_name, total_visits, usdt_balance, banned_status in employees:
+        status_text = "🚫 Banned" if banned_status else ""
+        employee_list_text += (
+            f"<b>@{emp_username}</b> ({emp_full_name or 'N/A'}) {status_text}\n"
+            f"  👁️ ভিজিট: {total_visits}, 💰 ব্যালেন্স: {usdt_balance:.2f} USDT\n"
+        )
+    await message.reply(employee_list_text, parse_mode=ParseMode.HTML)
+
+@dp.message(Command("click_user_list")) # NEW
+async def click_user_list_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
         return await message.reply("❌ আপনি অ্যাডমিন নন!")
     
-    report = "📋 Task Report:\n\n"
-    cur.execute("SELECT username, task_link FROM tasks")
-    tasks = cur.fetchall()
+    # Select distinct viewer_username and viewer_full_name from clicks
+    # Exclude those who are also employees
+    cur.execute("""
+        SELECT DISTINCT c.viewer_username, c.viewer_full_name, c.viewer_telegram_id
+        FROM clicks c
+        LEFT JOIN employees e ON c.viewer_username = e.username OR c.viewer_telegram_id = e.telegram_id
+        WHERE e.username IS NULL
+    """)
+    clicked_users = cur.fetchall()
 
-    if not tasks:
-        report += "কোনো টাস্ক অ্যাসাইন করা হয়নি।"
-    else:
-        for emp_username, link in tasks:
-            cur.execute("SELECT viewer_info FROM clicks WHERE ref = ?", (emp_username,))
-            viewers = [row[0] for row in cur.fetchall()]
-            report += f"👨‍💼 @{emp_username}\n🔗 Link: {link}\n👁️ Views: {len(viewers)}\n👤 Users: {', '.join(viewers) if viewers else 'None'}\n\n"
+    if not clicked_users:
+        return await message.reply("ℹ️ কোনো নন-এমপ্লয়ি ব্যবহারকারী রেফারেল লিংকে ক্লিক করেনি।")
     
-    await message.reply(report)
+    user_list_text = "👤 <b>রেফারেল লিংক ক্লিক করা ব্যবহারকারী (নন-এমপ্লয়ি):</b>\n\n"
+    for username, full_name, telegram_id in clicked_users:
+        user_list_text += f"• <b>{full_name or 'N/A'}</b> (@{username or 'N/A'}) [ID: {telegram_id or 'N/A'}]\n"
+    await message.reply(user_list_text, parse_mode=ParseMode.HTML)
 
-@dp.message(CommandStart())
-async def send_welcome(message: types.Message):
-    await message.reply(f"👋 স্বাগতম, {hbold(message.from_user.full_name)}! আপনি যদি এমপ্লয়ি হন, /get_task লিখুন।")
+
+# --- Balance and Visit Adjustment ---
+
+@dp.message(Command("set_usdt"))
+async def set_usdt_rate_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            return await message.reply("⚠️ সঠিকভাবে লিখুন: /set_usdt <amount> (যেমন: 1.00)")
+        
+        usdt_amount = float(parts[1])
+        if usdt_amount <= 0:
+            return await message.reply("❌ USDT রেট অবশ্যই 0 এর বেশি হতে হবে।")
+        
+        cur.execute("INSERT OR REPLACE INTO global_settings (key, value) VALUES (?, ?)", ('usdt_rate_per_1000_visits', str(usdt_amount)))
+        conn.commit()
+        await message.reply(f"✅ সফলভাবে 1000 ভিজিট এর জন্য USDT রেট সেট করা হলো: {usdt_amount:.2f} USDT")
+    except ValueError:
+        await message.reply("❌ অবৈধ সংখ্যা। সঠিকভাবে লিখুন: /set_usdt <amount>")
+    except Exception as e:
+        await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
+
+@dp.message(Command("em_visit_add"))
+async def employee_visit_add_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    try:
+        parts = message.text.split()
+        if len(parts) < 3:
+            return await message.reply("⚠️ সঠিকভাবে লিখুন: /em_visit_add @username <visits>")
+        
+        target_username = parts[1].replace('@', '')
+        visits_to_add = int(parts[2])
+        if visits_to_add <= 0:
+            return await message.reply("❌ যোগ করার ভিজিট সংখ্যা অবশ্যই 0 এর বেশি হতে হবে।")
+        
+        cur.execute("UPDATE employees SET total_visits = total_visits + ? WHERE username = ?", (visits_to_add, target_username))
+        conn.commit()
+        if cur.rowcount == 0:
+            return await message.reply(f"ℹ️ @{target_username} নামে কোনো কর্মচারী পাওয়া যায়নি।")
+        
+        await message.reply(f"✅ @{target_username} এর ভিজিট সংখ্যায় {visits_to_add} ভিজিট যোগ করা হলো।")
+    except ValueError:
+        await message.reply("❌ অবৈধ সংখ্যা। সঠিকভাবে লিখুন: /em_visit_add @username <visits>")
+    except Exception as e:
+        await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
+
+@dp.message(Command("em_visit_minus"))
+async def employee_visit_minus_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ আপনি অ্যাডমিন নন!")
+    try:
+        parts = message.text.split()
+        if len(parts) < 3:
+            return await message.reply("⚠️ সঠিকভাবে লিখুন: /em_visit_minus @username <visits>")
+        
+        target_username = parts[1].replace('@', '')
+        visits_to_minus = int(parts[2])
+        if visits_to_minus <= 0:
+            return await message.reply("❌ কমানোর ভিজিট সংখ্যা অবশ্যই 0 এর বেশি হতে হবে।")
+        
+        # Ensure total_visits doesn't go below zero
+        cur.execute("UPDATE employees SET total_visits = MAX(0, total_visits - ?) WHERE username = ?", (visits_to_minus, target_username))
+        conn.commit()
+        if cur.rowcount == 0:
+            return await message.reply(f"ℹ️ @{target_username} নামে কোনো কর্মচারী পাওয়া যায়নি।")
+        
+        await message.reply(f"✅ @{target_username} এর ভিজিট সংখ্যা থেকে {visits_to_minus} ভিজিট কমানো হলো।")
+    except ValueError:
+        await message.reply("❌ অবৈধ সংখ্যা। সঠিকভাবে লিখুন: /em_visit_minus @username <visits>")
+    except Exception as e:
+        await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
+
+
+@dp.message(Command("my_balance"))
+async def my_balance_handler(message: types.Message):
+    username = message.from_user.username
+    if not username:
+        return await message.reply("❌ আপনার টেলিগ্রাম ইউজারনেম সেট করা নেই।")
+    
+    cur.execute("SELECT total_visits, usdt_balance FROM employees WHERE username = ?", (username,))
+    employee_data = cur.fetchone()
+
+    if not employee_data:
+        return await message.reply("❌ আপনি একজন নিবন্ধিত কর্মচারী নন। `/join_employee` কমান্ড ব্যবহার করে যুক্ত হন।")
+    
+    total_visits = employee_data[0]
+    current_usdt_balance = employee_data[1] 
+
+    cur.execute("SELECT value FROM global_settings WHERE key = 'usdt_rate_per_1000_visits'")
+    usdt_rate_str = cur.fetchone()
+    usdt_rate = float(usdt_rate_str[0]) if usdt_rate_str else 0.0 
+
+    calculated_usdt = (total_visits / 1000) * usdt_rate
+
+    # Check for pending withdrawals
+    cur.execute("SELECT COUNT(*) FROM withdraw_requests WHERE employee_username = ? AND status = 'pending'", (username,))
+    pending_withdrawals = cur.fetchone()[0]
+
+    await message.reply(
+        f"💰 <b>আপনার ব্যালেন্স:</b>\n"
+        f"👁️ মোট ভিজিট: {total_visits}\n"
+        f"💵 আনুমানিক USDT ব্যালেন্স: {calculated_usdt:.2f} USDT\n"
+        f"আপনার বর্তমান উত্তোলনযোগ্য ব্যালেন্স: {current_usdt_balance:.2f} USDT\n"
+        f"পেন্ডিং উত্তোলন: {pending_withdrawals}টি\n\n"
+        f"উত্তোলন করতে: `/withdraw_usdt`"
+    , parse_mode=ParseMode.HTML)
+
+
+# --- Withdrawal System (Employee Side) ---
+@dp.message(Command("withdraw_usdt"))
+async def start_withdraw(message: types.Message, state: FSMContext):
+    username = message.from_user.username
+    cur.execute("SELECT usdt_balance, profile_set, bkash_number, binance_id FROM employees WHERE username = ?", (username,))
+    employee_data = cur.fetchone()
+
+    if not employee_data:
+        return await message.reply("❌ আপনি একজন নিবন্ধিত কর্মচারী নন। `/join_employee` কমান্ড ব্যবহার করে যুক্ত হন।")
+    
+    usdt_balance = employee_data[0]
+    profile_set = employee_data[1]
+    bkash_number = employee_data[2]
+    binance_id = employee_data[3]
+
+    if not profile_set:
+        return await message.reply("⚠️ উত্তোলন করার আগে আপনার প্রোফাইল সেট করুন: `/set_profile`")
+
+    if usdt_balance < 1.00: # Minimum withdrawal amount
+        return await message.reply(f"❌ উত্তোলনের জন্য আপনার ব্যালেন্সে কমপক্ষে 1.00 USDT থাকতে হবে। আপনার বর্তমান ব্যালেন্স: {usdt_balance:.2f} USDT")
+
+    amounts = [1.00, 5.00, 10.00, 30.00, 100.00]
+    available_amounts = [amt for amt in amounts if usdt_balance >= amt]
+
+    if not available_amounts:
+        return await message.reply(f"❌ আপনার বর্তমান ব্যালেন্স {usdt_balance:.2f} USDT দিয়ে কোনো উত্তোলন সম্ভব নয়।")
+
+    keyboard = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text=f"Withdraw ${amt:.2f}")] for amt in available_amounts
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer("আপনি কত USDT উত্তোলন করতে চান? (আপনার বর্তমান ব্যালেন্স: {usdt_balance:.2f} USDT)", reply_markup=keyboard)
+    await state.set_state(Withdrawal.amount)
+
+@dp.message(Withdrawal.amount)
+async def process_withdraw_amount(message: types.Message, state: FSMContext):
+    try:
+        text = message.text.replace("Withdraw $", "")
+        amount = float(text)
+        
+        username = message.from_user.username
+        cur.execute("SELECT usdt_balance FROM employees WHERE username = ?", (username,))
+        current_balance = cur.fetchone()[0]
+
+        if amount <= 0:
+            return await message.reply("❌ উত্তোলনের পরিমাণ অবশ্যই 0 এর বেশি হতে হবে।")
+
+        if amount > current_balance:
+            return await message.reply(f"❌ আপনার ব্যালেন্স যথেষ্ট নয়। আপনার ব্যালেন্স: {current_balance:.2f} USDT। অনুগ্রহ করে সঠিক পরিমাণ বেছে নিন বা টাইপ করুন।")
+        
+        await state.update_data(usdt_amount=amount)
+
+        # Ask for payment method
+        keyboard = types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="Bkash")],
+                [types.KeyboardButton(text="Binance")]
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        await message.answer("কোন মাধ্যমে পেমেন্ট নিতে চান?", reply_markup=keyboard)
+        await state.set_state(Withdrawal.payment_method)
+
+    except ValueError:
+        await message.reply("❌ অনুগ্রহ করে সঠিক উত্তোলনের পরিমাণ বেছে নিন বা সংখ্যায় টাইপ করুন।")
+    except Exception as e:
+        await message.reply(f"❌ একটি ত্রুটি হয়েছে: {e}")
+        await state.clear()
+
+@dp.message(Withdrawal.payment_method)
+async def process_withdraw_payment_method(message: types.Message, state: FSMContext):
+    payment_method = message.text
+    if payment_method not in ["Bkash", "Binance"]:
+        return await message.reply("❌ অনুগ্রহ করে 'Bkash' অথবা 'Binance' বেছে নিন।")
+    
+    username = message.from_user.username
+    cur.execute("SELECT bkash_number, binance_id FROM employees WHERE username = ?", (username,))
+    profile_data = cur.fetchone()
+    bkash_number = profile_data[0]
+    binance_id = profile_data[1]
+
+    if payment_method == "Bkash" and not bkash_number:
+        return await message.reply("⚠️ আপনার প্রোফাইলে বিকাশ নম্বর সেট করা নেই। দয়া করে সেট করুন `/set_profile`")
+    if payment_method == "Binance" and not binance_id:
+        return await message.reply("⚠️ আপনার প্রোফাইলে Binance ID সেট করা নেই। দয়া করে সেট করুন `/set_profile`")
+
+    await state.update_data(payment_method=payment_method)
+    await message.answer("উত্তোলন সম্পর্কে আপনার কোনো মন্তব্য থাকলে সর্বোচ্চ ৬০ অক্ষরের মধ্যে লিখুন (ঐচ্ছিক, না থাকলে 'না' লিখুন):")
+    await state.set_state(Withdrawal.comment)
+
+@dp.message(Withdrawal.comment)
+async def process_withdraw_comment(message: types.Message, state: FSMContext):
+    comment = message.text.strip()
+    if comment.lower() == 'না':
+        comment = ""
+    elif len(comment) > 60:
+        return await message.reply("❌ মন্তব্য ৬০ অক্ষরের বেশি হতে পারবে না।")
+    
+    await state.update_data(comment=comment)
+    
+    data = await state.get_data()
+    username = message.from_user.username
+    
+    amount = data['usdt_amount']
+    payment_method = data['payment_method']
+    
+    cur.execute("SELECT bkash_number, binance_id FROM employees WHERE username = ?", (username,))
+    profile_data = cur.fetchone()
+    payment_detail = profile_data[0] if payment_method == "Bkash" else profile_data[1]
+
+    # Save withdrawal request to DB
+    cur.execute("""
+        INSERT INTO withdraw_requests (employee_username, usdt_amount, payment_method, payment_detail, comment)
+        VALUES (?, ?, ?, ?, ?)
+    """, (username, amount, payment_method, payment_detail, comment))
+    conn.commit()
+
+    await message.reply(
+        f"✅ আপনার উত্তোলনের অনুরোধ সফলভাবে পাঠানো হয়েছে!\n"
+        f"পরিমাণ: {amount:.2f} USDT\n"
+        f"পেমেন্ট মাধ্যম: {payment_method}\n"
+        f"পেমেন্ট ডিটেইল: {payment_detail}\n"
+        f"মন্তব্য: {comment if comment else 'নেই'}\n\n"
+        "আমাদের অ্যাডমিন আপনার অনুরোধ পর্যালোচনা করবেন।"
+    , parse_mode=ParseMode.HTML, reply_markup=types.ReplyKeyboardRemove())
+    await state.clear()
 
 # --- Web Server for handling external HTTP requests (from footer.php) ---
 
 async def track_click_handler(request):
     try:
         data = await request.json()
-        ref = data.get('ref')
-        viewer_info = data.get('user_agent', 'Unknown User')
-        
-        if ref:
-            cur.execute("INSERT INTO clicks (ref, viewer_info) VALUES (?, ?)", (ref, viewer_info))
-            conn.commit()
-            logging.info(f"Tracked click for ref: {ref}, viewer: {viewer_info}")
+        ref_by_employee = data.get('ref')
+        viewer_username = data.get('viewer_username') # From JS
+        viewer_telegram_id = data.get('viewer_telegram_id') # From JS
+        viewer_full_name = data.get('viewer_full_name') # From JS
+        user_agent = data.get('user_agent', 'Unknown User')
+        page_url = data.get('page_url', 'Unknown URL')
+        is_visit_flag = data.get('is_visit', False) # True if JS sends after 12s
+        is_telegram_browser = data.get('is_telegram_browser', False)
 
-            if ADMIN_CHAT_ID:
-                try:
-                    await bot.send_message(
-                        chat_id=int(ADMIN_CHAT_ID),
-                        text=f"✅ নতুন ভিউ রেকর্ড করা হয়েছে!\nReferral: `{ref}`\nViewer Info: `{viewer_info}`",
-                        parse_mode=ParseMode.MARKDOWN_V2
-                    )
-                except Exception as e:
-                    logging.error(f"Failed to send admin notification: {e}")
-            
-            return web.json_response({"status": "success", "message": "Click tracked successfully"})
-        else:
-            return web.json_response({"status": "error", "message": "Missing 'ref' parameter"}, status=400)
+        today_date = datetime.date.today().isoformat()
+        # More generalized unique daily key for 20 visits per user/device
+        unique_daily_key_base = f"{viewer_telegram_id or viewer_username}_{today_date}"
+
+        # Check daily visit limit (max 20 per day per user/device for a specific employee)
+        cur.execute("""
+            SELECT COUNT(*) FROM clicks 
+            WHERE ref_by_employee = ? 
+            AND (viewer_telegram_id = ? OR viewer_username = ?) 
+            AND STRFTIME('%Y-%m-%d', timestamp) = ?
+        """, (ref_by_employee, viewer_telegram_id, viewer_username, today_date))
+        
+        visits_today = cur.fetchone()[0]
+
+        if visits_today >= 20:
+            logging.info(f"Daily visit limit reached for {viewer_username} for employee {ref_by_employee}.")
+            return web.json_response({"status": "limit_reached", "message": "Daily visit limit reached for this user."})
+
+
+        # Check if this specific page+employee has been visited by this user today (to avoid double counting same page visit for the same day)
+        # This is more precise unique_daily_key for the DB row.
+        unique_entry_key = f"{viewer_telegram_id or viewer_username}_{today_date}_{ref_by_employee}_{page_url}"
+        cur.execute("SELECT id FROM clicks WHERE unique_daily_key = ?", (unique_entry_key,))
+        if cur.fetchone():
+            logging.info(f"Duplicate click for {unique_entry_key}. Skipping.")
+            return web.json_response({"status": "duplicate", "message": "Duplicate click for this specific page/user today."})
+
+
+        # Insert into clicks table
+        cur.execute("""
+            INSERT INTO clicks (ref_by_employee, viewer_telegram_id, viewer_username, viewer_full_name,
+                                user_agent, page_url, is_visit, is_click, is_telegram_browser, unique_daily_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ref_by_employee, viewer_telegram_id, viewer_username, viewer_full_name,
+            user_agent, page_url, is_visit_flag, True, is_telegram_browser, unique_entry_key
+        ))
+        conn.commit()
+
+        # Update employee's total_visits/total_clicks
+        if is_visit_flag:
+            cur.execute("UPDATE employees SET total_visits = total_visits + 1 WHERE username = ?", (ref_by_employee,))
+        cur.execute("UPDATE employees SET total_clicks = total_clicks + 1 WHERE username = ?", (ref_by_employee,))
+        conn.commit()
+        
+        logging.info(f"Tracked click for ref: {ref_by_employee}, viewer: {viewer_username}, URL: {page_url}, Visit: {is_visit_flag}")
+
+        if ADMIN_CHAT_ID:
+            try:
+                domain_name = urlparse(page_url).netloc
+                status_emoji = "✅ ভিজিট" if is_visit_flag else "🔗 ক্লিক"
+                await bot.send_message(
+                    chat_id=int(ADMIN_CHAT_ID),
+                    text=(f"<b>{status_emoji} রেকর্ড করা হয়েছে!</b>\n"
+                          f"<b>রেফারেল:</b> <code>{ref_by_employee}</code>\n"
+                          f"<b>ডোমেইন:</b> {domain_name}\n"
+                          f"<b>পেজ URL:</b> {hcode(page_url)}\n"
+                          f"<b>ভিউয়ার:</b> {hbold(viewer_full_name)} (@{viewer_username})\n"
+                          f"<b>ব্রাউজার:</b> {'Telegram' if is_telegram_browser else 'External'}\n"
+                          f"<b>ইউজার এজেন্ট:</b> <code>{user_agent}</code>"),
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logging.error(f"Failed to send admin notification: {e}")
+        
+        return web.json_response({"status": "success", "message": "Click tracked successfully"})
     except Exception as e:
         logging.error(f"Error in track_click_handler: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
