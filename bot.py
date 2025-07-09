@@ -454,12 +454,6 @@ async def process_tiktok(message: types.Message, state: FSMContext):
 @dp.message(ProfileSetup.website)
 async def process_website(message: types.Message, state: FSMContext):
     await state.update_data(website_link=message.text)
-    await message.answer("আপনার সম্পর্কে <b>কিছু কথা</b> লিখুন:")
-    await state.set_state(ProfileSetup.about_yourself)
-
-@dp.message(ProfileSetup.about_yourself)
-async def process_about_yourself(message: types.Message, state: FSMContext):
-    await state.update_data(about_yourself=message.text)
     
     user_data = await state.get_data()
     username = message.from_user.username
@@ -1067,7 +1061,8 @@ async def process_withdraw_comment(message: types.Message, state: FSMContext):
     amount = data['usdt_amount']
     payment_method = data['payment_method']
     
-    cur.execute("SELECT bkash_number, binance_id FROM employees WHERE username = ?, (username,))
+    # CORRECTED LINE 1070:
+    cur.execute("SELECT bkash_number, binance_id FROM employees WHERE username = ?", (username,))
     profile_data = cur.fetchone()
     payment_detail = profile_data[0] if payment_method == "Bkash" else profile_data[1]
 
